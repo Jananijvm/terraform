@@ -1,0 +1,407 @@
+// v2
+pipeline {
+    agent { node { label 'ubuntu-agent' } }
+
+    environment {
+        ENV_NAME = "${AROCORD_INSIGHTS_STANDALONE_TARGET_DEPLOY_ENV}"
+
+        DEPLOY_TARGETS = """
+       
+        796576079658 ap-south-1 
+        """
+    }
+
+    stages {
+
+        stage('Validate Targets') {
+            steps {
+                script {
+                    def targets = env.DEPLOY_TARGETS.trim().split("\n")
+
+                    if (!targets) {
+                        error("DEPLOY_TARGETS empty")
+                    }
+
+                    targets.each { t ->
+                        def parts = t.trim().tokenize()
+                        if (parts.size() < 2) {
+                            error("Invalid target: ${t}")
+                        }
+                    }
+                }
+            }
+        }
+
+//         stage('Checkout Repo') {
+//             steps {
+//                 checkout scm
+//             }
+//         }
+
+            stage('Deploy') {
+            steps {
+                script {
+
+                    def targets = env.DEPLOY_TARGETS.trim().split("\n")
+
+                    def currentAccount = sh(
+                        script: "aws sts get-caller-identity --query Account --output text",
+                        returnStdout: true
+                    ).trim()
+
+                    // LOOP = SEQUENTIAL execution
+                    targets.each { t ->
+
+                        def parts = t.trim().tokenize()
+
+                        def account = parts[0]
+                        def region  = parts[1]
+
+                        def bucket = (parts.size() == 3) ?
+                            parts[2] :
+                            "${account}-${ENV_NAME}-mghealth-artifacts-${region}/arocordinsights-standalone"
+
+                        stage("Deploy-${account}-${region}") {
+
+                            if (account != currentAccount) {
+
+                                def roleArn = "arn:aws:iam::${account}:role/JenkinsDeployRole"
+
+                                def creds = sh(
+                                    script: """
+                                    aws sts assume-role \
+                                    --role-arn ${roleArn} \
+                                    --role-session-name jenkins \
+                                    --duration-seconds 3600 \
+                                    --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+                                    --output text
+                                    """,
+                                    returnStdout: true
+                                ).trim().tokenize()
+
+                                withEnv([
+                                    "AWS_ACCESS_KEY_ID=${creds[0]}",
+                                    "AWS_SECRET_ACCESS_KEY=${creds[1]}",
+                                    "AWS_SESSION_TOKEN=${creds[2]}",
+                                    "AWS_REGION=${region}",
+                                    "AWS_DEFAULT_REGION=${region}",
+                                    "ARTIFACT_BASE=${bucket}"
+                                ]) {
+                                    runFullDeploy()
+                                }
+
+                            } else {
+
+                                withEnv([
+                                    "AWS_REGION=${region}",
+                                    "AWS_DEFAULT_REGION=${region}",
+                                    "ARTIFACT_BASE=${bucket}"
+                                ]) {
+                                    runFullDeploy()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+             always {
+            cleanWs(
+                cleanWhenNotBuilt: false,
+                deleteDirs: true,
+                disableDeferredWipeout: false,
+                notFailBuild: true
+            )
+        }
+    }
+}
+
+def runFullDeploy() {
+
+    sh '''#!/bin/bash
+    set -e
+
+    echo "Deploying to $AWS_REGION"
+
+    # -------------------------
+    # Copy environment-specific backend.tf
+    # -------------------------
+    cp config/${ENV_NAME}/backend.tf src/backend.tf
+
+    # -------------------------
+    # Unique files per region
+    # -------------------------
+    TFVARS_FILE="terraform-${AWS_REGION}.tfvars"
+    SRC_TFVARS_FILE="src/terraform-${AWS_REGION}.tfvars"
+
+    # -------------------------
+    # Artifact parsing
+    # -------------------------
+    ARTIFACT_BUCKET=$(echo $ARTIFACT_BASE | cut -d'/' -f1)
+    ARTIFACT_PATH=$(echo $ARTIFACT_BASE | cut -d'/' -f2-)
+
+    aws s3 cp s3://${ARTIFACT_BUCKET}/${ARTIFACT_PATH}/arocord-summarizer-api/arocord-api-latest-build.txt arocord-api-latest-build.txt
+
+    BUILD_ID=$(grep '^BUILD_ID=' arocord-api-latest-build.txt | cut -d= -f2)
+    BRANCH=$(grep '^BRANCH=' arocord-api-latest-build.txt | cut -d= -f2)
+
+    [ -z "$BUILD_ID" ] && echo "BUILD_ID missing" && exit 1
+    [ -z "$BRANCH" ] && echo "BRANCH missing" && exit 1
+
+    ENV_FILE="config/${ENV_NAME}/terraform.tfvars"
+    [ ! -f "$ENV_FILE" ] && echo "Missing tfvars file: $ENV_FILE" && exit 1
+
+    grep -vE '^(artifact_bucket|artifact_base_path|artifact_region)' "$ENV_FILE" > $TFVARS_FILE
+
+    echo "artifact_bucket = \\"${ARTIFACT_BUCKET}\\"" >> $TFVARS_FILE
+    echo "artifact_base_path = \\"${ARTIFACT_PATH}/arocord-summarizer-api/${BRANCH}/${BUILD_ID}\\"" >> $TFVARS_FILE
+    echo "artifact_region = \\"${AWS_REGION}\\"" >> $TFVARS_FILE
+
+    cp $TFVARS_FILE $SRC_TFVARS_FILE
+
+    # -------------------------
+    # Terraform Init (SAFE)
+    # -------------------------
+    cd src
+
+    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+    terraform init -reconfigure \
+      -backend-config="key=arocord/${ENV_NAME}/${ACCOUNT_ID}/${AWS_REGION}/terraform.tfstate"
+
+    terraform apply -auto-approve -target=module.ecr \
+        -var="account_id=$ACCOUNT_ID" \
+        -var="region=$AWS_REGION" \
+        -var="image_tag=$BUILD_ID" \
+        -var-file=terraform-${AWS_REGION}.tfvars
+
+    cd ..
+
+    # -------------------------
+    # Build & Push Docker
+    # -------------------------
+    artifact_base_path=$(grep '^artifact_base_path' src/terraform-${AWS_REGION}.tfvars | cut -d'"' -f2)
+    BASE_PATH="s3://${ARTIFACT_BUCKET}/${artifact_base_path}/lambda-functions"
+
+    SERVICES=(
+      "arocord-insights-standalone-soap-email-template-worker-lambda"
+      "arocord-insights-standalone-transcription-worker-lambda"
+      "arocord-insights-standalone-soap-refine-worker-lambda"
+      "arocord-insights-standalone-soap-worker-lambda"
+    )
+
+    aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+    for SERVICE in "${SERVICES[@]}"; do
+        ZIP_FILE="${SERVICE}.zip"
+        aws s3 cp "$BASE_PATH/$ZIP_FILE" .
+
+        BUILD_DIR="build_${SERVICE}_${AWS_REGION}"
+        rm -rf $BUILD_DIR
+        mkdir $BUILD_DIR
+        unzip -q $ZIP_FILE -d $BUILD_DIR
+
+        docker build --no-cache -t ${SERVICE}_${AWS_REGION} ./$BUILD_DIR
+
+        REPO_NAME="${SERVICE}-${AWS_REGION}"
+        IMAGE_BASE="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME"
+
+        docker tag ${SERVICE}_${AWS_REGION}:latest $IMAGE_BASE:$BUILD_ID
+        docker tag ${SERVICE}_${AWS_REGION}:latest $IMAGE_BASE:latest
+
+        docker push $IMAGE_BASE:$BUILD_ID
+        docker push $IMAGE_BASE:latest
+    done
+
+    # -------------------------
+    # Final Apply
+    # -------------------------
+    cd src
+
+    terraform init -reconfigure \
+      -backend-config="key=arocord/${ENV_NAME}/${ACCOUNT_ID}/${AWS_REGION}/terraform.tfstate"
+
+    terraform apply -auto-approve \
+        -var="account_id=$ACCOUNT_ID" \
+        -var="region=$AWS_REGION" \
+        -var="image_tag=$BUILD_ID" \
+        -var-file=terraform-${AWS_REGION}.tfvars
+
+    echo "Deployment complete for $ACCOUNT_ID - $AWS_REGION"
+    '''
+}
+
+// // destroy
+// pipeline {
+//     agent { node { label 'ubuntu-agent' } }
+
+//     parameters {
+//         booleanParam(
+//             name: 'CONFIRM_DESTROY_ALL',
+//             defaultValue: false,
+//             description: 'Set TRUE to destroy ALL infrastructure'
+//         )
+//     }
+
+//     environment {
+//         ENV_NAME = "${AROCORD_INSIGHTS_STANDALONE_TARGET_DEPLOY_ENV}"
+
+//         DEPLOY_TARGETS = """
+//      796576079658 ap-south-1 
+//    """
+//     }
+
+//     stages {
+
+//         stage('Validate Input') {
+//             steps {
+//                 script {
+//                     if (!params.CONFIRM_DESTROY_ALL) {
+//                         error("CONFIRM_DESTROY_ALL must be TRUE")
+//                     }
+
+//                     def targets = env.DEPLOY_TARGETS.trim().split("\n")
+
+//                     if (!targets) {
+//                         error("No targets defined")
+//                     }
+
+//                     targets.each { t ->
+//                         def parts = t.trim().tokenize()
+//                         if (parts.size() < 2) {
+//                             error("Invalid target: ${t}")
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+
+//         stage('Destroy All Targets') {
+//             steps {
+//                 script {
+
+//                     def targets = env.DEPLOY_TARGETS.trim().split("\n")
+
+//                     def currentAccount = sh(
+//                         script: "aws sts get-caller-identity --query Account --output text",
+//                         returnStdout: true
+//                     ).trim()
+
+//                     def parallelStages = [:]
+
+//                     targets.each { t ->
+
+//                         def parts = t.trim().tokenize()
+//                         def account = parts[0]
+//                         def region  = parts[1]
+
+//                         parallelStages["Destroy-${account}-${region}"] = {
+
+//                             stage("Destroy-${account}-${region}") {
+
+//                                 dir("workspace-${account}-${region}") {
+
+//                                     checkout scm
+
+//                                     if (account != currentAccount) {
+
+//                                         def roleArn = "arn:aws:iam::${account}:role/JenkinsDeployRole"
+
+//                                         def creds = sh(
+//                                             script: """
+//                                             aws sts assume-role \
+//                                             --role-arn ${roleArn} \
+//                                             --role-session-name jenkins \
+//                                             --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+//                                             --output text
+//                                             """,
+//                                             returnStdout: true
+//                                         ).trim().tokenize()
+
+//                                         withEnv([
+//                                             "AWS_ACCESS_KEY_ID=${creds[0]}",
+//                                             "AWS_SECRET_ACCESS_KEY=${creds[1]}",
+//                                             "AWS_SESSION_TOKEN=${creds[2]}",
+//                                             "AWS_REGION=${region}",
+//                                             "AWS_DEFAULT_REGION=${region}"
+//                                         ]) {
+//                                             destroyInfra()
+//                                         }
+
+//                                     } else {
+
+//                                         withEnv([
+//                                             "AWS_REGION=${region}",
+//                                             "AWS_DEFAULT_REGION=${region}"
+//                                         ]) {
+//                                             destroyInfra()
+//                                         }
+//                                     }
+//                                 }
+//                             }
+//                         }
+//                     }
+
+//                     parallel parallelStages
+//                 }
+//             }
+//         }
+//     }
+
+//     post {
+//         always {
+//             cleanWs(
+//                 cleanWhenNotBuilt: false,
+//                 deleteDirs: true,
+//                 disableDeferredWipeout: false,
+//                 notFailBuild: true
+//             )
+//         }
+//     }
+// }
+
+// def destroyInfra() {
+
+//     sh '''#!/bin/bash
+//     set -e
+
+//     echo "Destroying in $AWS_REGION"
+
+//     cd src
+
+//     ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+//     echo "Identity:"
+//     aws sts get-caller-identity
+
+//     # Clean plugins (avoid corruption)
+//     rm -rf .terraform .terraform.lock.hcl
+
+//     # Copy environment-specific backend.tf
+//     cp ../config/${ENV_NAME}/backend.tf .
+
+//     if [ ! -f "terraform.tfvars" ]; then
+//         echo " Missing terraform.tfvars"
+//         exit 1
+//     fi
+
+//     STATE_KEY="arocord/${ENV_NAME}/${ACCOUNT_ID}/${AWS_REGION}/terraform.tfstate"
+
+//     echo "Using state: $STATE_KEY"
+
+//     terraform init -reconfigure \
+//       -backend-config="key=$STATE_KEY"
+
+//     terraform destroy -auto-approve \
+//       -var="account_id=$ACCOUNT_ID" \
+//       -var="region=$AWS_REGION" \
+//       -var="image_tag=dummy" \
+//       -var="artifact_region=$AWS_REGION" \
+//       -var-file=terraform.tfvars
+
+//     echo "Destroy complete: $ACCOUNT_ID / $AWS_REGION"
+//     '''
+// }

@@ -1,0 +1,96 @@
+############################
+# SCALARS
+############################
+scalar AWSDateTime
+
+############################
+# EMAIL JOB
+############################
+type EmailJob @aws_iam
+@aws_cognito_user_pools {
+	jobId: ID!
+	status: String!
+	outputFile: String
+	updatedAt: AWSDateTime
+}
+
+############################
+# SOAP JOB (Initial SOAP Generation)
+############################
+type SoapJob @aws_iam
+@aws_cognito_user_pools {
+	jobId: ID!
+	status: String!
+	outputFile: String
+	createdAt: AWSDateTime!
+	updatedAt: AWSDateTime!
+}
+
+############################
+# SOAP REFINE JOB
+############################
+type SoapRefineJob @aws_iam
+@aws_cognito_user_pools {
+	jobId: ID!
+	status: String!
+	outputFile: String
+	updatedAt: AWSDateTime
+}
+
+############################
+# TRANSCRIPT JOB
+############################
+type TranscriptJob @aws_iam
+@aws_cognito_user_pools {
+	jobId: ID!
+	status: String!
+	outputFile: String
+	createdAt: AWSDateTime!
+	updatedAt: AWSDateTime!
+}
+
+############################
+# MUTATIONS
+############################
+type Mutation @aws_iam {
+	createTranscriptJob(s3Key: String!, language: String): TranscriptJob
+	updateTranscriptJob(jobId: ID!, status: String, outputFile: String): TranscriptJob
+	updateSoapJob(jobId: ID!, status: String, outputFile: String): SoapJob
+	updateSoapRefineJob(jobId: ID!, status: String!, outputFile: String): SoapRefineJob
+	# NEW EMAIL UPDATE MUTATION
+	updateEmailJob(jobId: ID!, status: String!, outputFile: String): EmailJob
+}
+
+############################
+# QUERIES
+############################
+type Query @aws_iam
+@aws_cognito_user_pools {
+	getTranscriptJob(jobId: ID!): TranscriptJob
+	getSoapJob(jobId: ID!): SoapJob
+}
+
+############################
+# SUBSCRIPTIONS
+############################
+type Subscription @aws_iam
+@aws_cognito_user_pools {
+	onTranscriptJobUpdated(jobId: ID!): TranscriptJob
+		@aws_subscribe(mutations: ["updateTranscriptJob"])
+	onSoapJobUpdated(jobId: ID!): SoapJob
+		@aws_subscribe(mutations: ["updateSoapJob"])
+	onSoapRefineJobUpdated(jobId: ID!): SoapRefineJob
+		@aws_subscribe(mutations: ["updateSoapRefineJob"])
+	# NEW EMAIL SUBSCRIPTION
+	onEmailJobUpdated(jobId: ID!): EmailJob
+		@aws_subscribe(mutations: ["updateEmailJob"])
+}
+
+############################
+# SCHEMA ROOT
+############################
+schema {
+	query: Query
+	mutation: Mutation
+	subscription: Subscription
+}
